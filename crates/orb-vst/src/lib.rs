@@ -1,7 +1,8 @@
 //! ReBirth VST: the OpenRB-338 engine as a VST3 instrument (nih-plug), played from a MIDI
-//! keyboard. Spike RV-02: one plugin instance is one whole engine, and MIDI notes play TB-303 #1
-//! with ReBirth's transport stopped; the 303 #2, the drum machines, the effects and the mixer
-//! are there but not reachable yet.
+//! keyboard. One plugin instance is one whole engine, and MIDI notes play the two TB-303s
+//! (mono, legato notes slide; the "Keyboard target" parameter says which channel plays which)
+//! with ReBirth's transport stopped; the drum machines, the effects and the mixer are there but
+//! not reachable yet.
 //!
 //! The plugin is a thin layer over [`synth::Synth`], which holds no nih-plug type: the plugin
 //! builds it in [`Plugin::initialize`] (where allocation is allowed) at the host's rate, and
@@ -21,28 +22,98 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
-use synth::Synth;
+use synth::{Synth, Voice};
 
 /// The plugin. [`Default`] makes it without an engine; [`Plugin::initialize`] builds one.
 pub struct ReBirthVst {
-    params: Arc<NoParams>,
+    params: Arc<KeyboardParams>,
     synth: Option<Synth>,
+    /// The target the last `process` saw: a change releases every key.
+    target: KeyboardTarget,
 }
 
-/// No automatable parameter yet.
-#[derive(Params, Default)]
-pub struct NoParams {}
+/// Which 303 the keyboard plays.
+///
+/// The ids of the variants are stored in saved projects: never change them.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardTarget {
+    /// MIDI channel 2 plays 303 #2, every other channel plays 303 #1.
+    #[id = "by_channel"]
+    #[name = "By channel"]
+    ByChannel,
+    /// Every channel plays 303 #1.
+    #[id = "a"]
+    #[name = "303 A"]
+    A,
+    /// Every channel plays 303 #2.
+    #[id = "b"]
+    #[name = "303 B"]
+    B,
+}
 
-impl Default for ReBirthVst {
-    fn default() -> Self {
-        ReBirthVst {
-            params: Arc::new(NoParams::default()),
-            synth: None,
+impl KeyboardTarget {
+    /// The 303 that plays MIDI channel `channel` (nih-plug's 0-based: 0 is MIDI channel 1).
+    pub fn voice(self, channel: u8) -> Voice {
+        match self {
+            KeyboardTarget::A => Voice::A,
+            KeyboardTarget::B => Voice::B,
+            // MIDI channel 10 (index 9) will be the drums (RV-04): it is not special-cased yet
+            KeyboardTarget::ByChannel if channel == 1 => Voice::B,
+            KeyboardTarget::ByChannel => Voice::A,
         }
     }
 }
 
+/// The plugin's parameters.
+///
+/// The `#[id]`s are permanent: hosts find the parameters in saved projects by them (as
+/// [`Vst3Plugin::VST3_CLASS_ID`] finds the plugin). Never rename them.
+#[derive(Params)]
+pub struct KeyboardParams {
+    /// Where the MIDI channels go.
+    #[id = "target"]
+    pub target: EnumParam<KeyboardTarget>,
+    /// The velocity from which a note is accented.
+    #[id = "accent_velocity"]
+    pub accent_velocity: IntParam,
+}
+
+impl Default for KeyboardParams {
+    fn default() -> Self {
+        KeyboardParams {
+            target: EnumParam::new("Keyboard target", KeyboardTarget::ByChannel),
+            accent_velocity: IntParam::new(
+                "Accent velocity",
+                synth::ACCENT_VELOCITY as i32,
+                IntRange::Linear { min: 1, max: 127 },
+            ),
+        }
+    }
+}
+
+impl Default for ReBirthVst {
+    fn default() -> Self {
+        Self::with_params(KeyboardParams::default())
+    }
+}
+
 impl ReBirthVst {
+    /// A plugin with these parameters, as a host's state would restore them (the tests build
+    /// non-default ones with it: nih-plug has no public setter for a parameter's value outside
+    /// its own wrappers).
+    pub fn with_params(params: KeyboardParams) -> Self {
+        ReBirthVst {
+            target: params.target.value(),
+            params: Arc::new(params),
+            synth: None,
+        }
+    }
+
+    /// The parameters.
+    pub fn keyboard_params(&self) -> &Arc<KeyboardParams> {
+        &self.params
+    }
+
     /// The synth, once [`Plugin::initialize`] has built it.
     pub fn synth(&self) -> Option<&Synth> {
         self.synth.as_ref()
@@ -122,6 +193,14 @@ impl Plugin for ReBirthVst {
         };
         let (l, rest) = out.split_at_mut(1);
         let (l, r) = (&mut *l[0], &mut *rest[0]);
+        // the parameters, read once per buffer (atomic loads): a new target releases every key
+        // of both 303s, so no note is left sounding on a voice that no longer gets its note-off
+        let target = self.params.target.value();
+        if target != self.target {
+            self.target = target;
+            synth.all_notes_off();
+        }
+        synth.set_accent_velocity(self.params.accent_velocity.value().clamp(1, 127) as u8);
         let mut pos = 0;
         while let Some(ev) = context.next_event() {
             let at = (ev.timing() as usize).min(n);
@@ -130,10 +209,15 @@ impl Plugin for ReBirthVst {
                 pos = at;
             }
             match ev {
-                NoteEvent::NoteOn { note, velocity, .. } => {
-                    synth.note_on(note, midi_velocity(velocity))
+                NoteEvent::NoteOn {
+                    channel,
+                    note,
+                    velocity,
+                    ..
+                } => synth.note_on(target.voice(channel), note, midi_velocity(velocity)),
+                NoteEvent::NoteOff { channel, note, .. } => {
+                    synth.note_off(target.voice(channel), note)
                 }
-                NoteEvent::NoteOff { note, .. } => synth.note_off(note),
                 NoteEvent::Choke { .. } => synth.all_notes_off(),
                 _ => {}
             }

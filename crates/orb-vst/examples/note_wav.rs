@@ -9,7 +9,7 @@
 
 use std::io::Write;
 
-use orb_vst::synth::Synth;
+use orb_vst::synth::{Synth, Voice};
 
 fn arg(args: &[String], i: usize, default: u32) -> u32 {
     args.get(i)
@@ -30,9 +30,9 @@ fn main() {
     let frames = 2 * rate as usize;
     let held = rate as usize / 2;
     let (mut l, mut r) = (vec![0.0f32; frames], vec![0.0f32; frames]);
-    s.note_on(note, velocity);
+    s.note_on(Voice::A, note, velocity);
     s.render(&mut l[..held], &mut r[..held]);
-    s.note_off(note);
+    s.note_off(Voice::A, note);
     s.render(&mut l[held..], &mut r[held..]);
     let peak = l.iter().chain(&r).fold(0.0f32, |m, v| m.max(v.abs()));
     let tail = l[frames - rate as usize / 2..]

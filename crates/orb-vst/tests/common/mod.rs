@@ -7,7 +7,28 @@
 use std::cell::Cell;
 
 use nih_plug::prelude::*;
-use orb_vst::ReBirthVst;
+use orb_vst::{KeyboardTarget, ReBirthVst};
+
+/// The stable id of a target value (the one a host's saved state holds).
+pub fn target_id(target: KeyboardTarget) -> &'static str {
+    match target {
+        KeyboardTarget::ByChannel => "by_channel",
+        KeyboardTarget::A => "a",
+        KeyboardTarget::B => "b",
+    }
+}
+
+/// Switches the target as the host does, between two `process` calls. nih-plug has no safe
+/// public setter outside its wrappers: the type-erased parameter behind `as_ptr` has one, by
+/// the stable id.
+pub fn set_target(p: &ReBirthVst, target: KeyboardTarget) {
+    let ptr = p.keyboard_params().target.as_ptr();
+    let ParamPtr::EnumParam(inner) = ptr else {
+        panic!("the target is not an enum parameter");
+    };
+    // SAFETY: the pointer is to the parameter inside `p`, which outlives this call
+    assert!(unsafe { &*inner }.set_from_id(target_id(target)));
+}
 
 /// The host's buffer, in frames.
 pub const HOST_BUFFER: usize = 128;
@@ -56,7 +77,11 @@ impl ProcessContext<ReBirthVst> for Process<'_> {
 
 /// A plugin initialized at `rate` Hz, and the latency it reported.
 pub fn plugin(rate: u32) -> (ReBirthVst, Option<u32>) {
-    let mut p = ReBirthVst::default();
+    plugin_with(ReBirthVst::default(), rate)
+}
+
+/// `p` initialized at `rate` Hz, and the latency it reported.
+pub fn plugin_with(mut p: ReBirthVst, rate: u32) -> (ReBirthVst, Option<u32>) {
     let mut init = Init {
         latency: Cell::new(None),
     };
@@ -72,24 +97,34 @@ pub fn plugin(rate: u32) -> (ReBirthVst, Option<u32>) {
     (p, init.latency.get())
 }
 
-/// A note-on at frame `at` of the render, on channel 0.
+/// A note-on at frame `at` of the render, on MIDI channel 1 (nih-plug's channel 0).
 pub fn on(at: usize, note: u8, velocity: u8) -> (usize, NoteEvent<()>) {
+    on_ch(at, 1, note, velocity)
+}
+
+/// A note-off at frame `at`, on MIDI channel 1.
+pub fn off(at: usize, note: u8) -> (usize, NoteEvent<()>) {
+    off_ch(at, 1, note)
+}
+
+/// A note-on on MIDI channel `channel` (1-based, as a musician counts them).
+pub fn on_ch(at: usize, channel: u8, note: u8, velocity: u8) -> (usize, NoteEvent<()>) {
     let e = NoteEvent::NoteOn {
         timing: 0,
         voice_id: None,
-        channel: 0,
+        channel: channel - 1,
         note,
         velocity: velocity as f32 / 127.0,
     };
     (at, e)
 }
 
-/// A note-off at frame `at`.
-pub fn off(at: usize, note: u8) -> (usize, NoteEvent<()>) {
+/// A note-off on MIDI channel `channel` (1-based).
+pub fn off_ch(at: usize, channel: u8, note: u8) -> (usize, NoteEvent<()>) {
     let e = NoteEvent::NoteOff {
         timing: 0,
         voice_id: None,
-        channel: 0,
+        channel: channel - 1,
         note,
         velocity: 0.0,
     };
@@ -220,4 +255,18 @@ pub fn pitch(x: &[f32], rate: u32) -> f64 {
 /// The first frame whose absolute value exceeds `threshold`.
 pub fn onset(x: &[f32], threshold: f32) -> Option<usize> {
     x.iter().position(|v| v.abs() > threshold)
+}
+
+/// The fundamental of `x` at `rate` Hz, between 40 and 200 Hz: the first maximum of the
+/// autocorrelation within 90 % of the best one. [`pitch`] takes the best, which for a 303 note
+/// above 80 Hz is often the octave below (the second period correlates as well as the first).
+pub fn fundamental(x: &[f32], rate: u32) -> f64 {
+    let (lo, hi) = (rate as usize / 200, rate as usize / 40);
+    let n = x.len() - hi;
+    let corr = |lag: usize| -> f64 { (0..n).map(|i| x[i] as f64 * x[i + lag] as f64).sum::<f64>() };
+    let c: Vec<f64> = (lo..=hi).map(corr).collect();
+    let best = c.iter().cloned().fold(f64::MIN, f64::max);
+    (1..c.len() - 1)
+        .find(|&i| c[i] >= 0.9 * best && c[i] >= c[i - 1] && c[i] >= c[i + 1])
+        .map_or(0.0, |i| rate as f64 / (lo + i) as f64)
 }
