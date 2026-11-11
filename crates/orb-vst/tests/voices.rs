@@ -409,22 +409,30 @@ fn the_accent_threshold_follows_the_parameter() {
     assert_eq!(defaults.target.value(), KeyboardTarget::ByChannel);
 }
 
-/// The threshold applies to the key a release returns to, with the velocity it was pressed at.
+/// The key a release returns to plays with the velocity it was pressed at: the return is the
+/// same slide as pressing that key again with that velocity (a legato key like any other), to
+/// the sample.
 #[test]
-fn the_accent_of_a_returned_to_key_follows_its_own_velocity() {
+fn a_returned_to_key_keeps_the_velocity_it_was_pressed_at() {
     let frames = 36_096;
     let (t, u) = (12_000, 24_000);
-    let run = |velocity: u8| {
-        let events = [on(0, C2, velocity), on(t, G2, SOFT), off(u, G2)];
-        play(KeyboardTarget::A, frames, &events)
-    };
-    let soft = run(SOFT);
-    let hard = run(110);
-    // identical until the first key's own accent (same as before Y): they already differ at 0
-    assert!(
-        max_diff(&soft, &hard, u) > 0.001,
-        "the held key's accent is lost on the way back"
-    );
+    for velocity in [SOFT, 110] {
+        let back = play(
+            KeyboardTarget::A,
+            frames,
+            &[on(0, C2, velocity), on(t, G2, SOFT), off(u, G2)],
+        );
+        let pressed = play(
+            KeyboardTarget::A,
+            frames,
+            &[on(0, C2, velocity), on(t, G2, SOFT), on(u, C2, velocity)],
+        );
+        assert!(
+            back == pressed,
+            "velocity {velocity}: the return is not the held key's own slide: {}",
+            max_diff(&back, &pressed, 0)
+        );
+    }
 }
 
 /// The stack of held keys is 16 deep: with 20 keys down and all up again, the gate closes.
