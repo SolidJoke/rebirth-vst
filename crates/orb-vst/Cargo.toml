@@ -1,0 +1,23 @@
+[package]
+name = "orb-vst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The plugin is the cdylib; the rlib is what the tests and the example link.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+orb-engine = { path = "../orb-engine" }
+# The note queue into the 303, lock-free (as orb-player's command queue).
+rtrb = "0.4.1"
+# The resampler to the host's rate (sinc only, as orb-player's).
+rubato = { version = "5.0.1", default-features = false }
+
+# The plugin framework (ISC; its VST3 bindings are GPL-3.0), pinned to one commit of its
+# repository: it is not published on crates.io. Default features: the VST3 export only.
+[dependencies.nih_plug]
+git = "https://github.com/robbert-vdh/nih-plug"
+rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683"

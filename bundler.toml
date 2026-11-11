@@ -1,0 +1,5 @@
+# nih-plug's bundler (crates/xtask): the bundle name of each plugin package.
+# `cargo run -p xtask --release -- bundle orb-vst --release` writes target/bundled/ReBirth VST.vst3.
+
+[orb-vst]
+name = "ReBirth VST"

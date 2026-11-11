@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# nih-plug's bundler: `cargo run -p xtask --release -- bundle orb-vst --release` builds the
+# plugin and wraps it into target/bundled/ReBirth VST.vst3 (the name from bundler.toml).
+[dependencies.nih_plug_xtask]
+git = "https://github.com/robbert-vdh/nih-plug"
+rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683"
