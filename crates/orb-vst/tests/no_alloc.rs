@@ -19,7 +19,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{Host, off, on, plugin};
+use common::{Host, off, off_ch, on, on_ch, plugin};
+use orb_vst::KeyboardTarget;
+use orb_vst::synth::Voice;
 
 struct Counting;
 
@@ -97,6 +99,62 @@ fn process_and_reset_do_not_allocate() {
             }
         }
         assert!(common::peak(&host.l) > 0.01, "{rate} Hz: silent");
+        assert_eq!(n, 0, "{rate} Hz: process allocated or freed {n} times");
+    }
+}
+
+/// RV-03's paths: legato slides, the return to a held key, notes on both 303s by channel, a key
+/// pressed beyond the stack's depth, and a change of the keyboard target (which releases every
+/// key) between two buffers.
+#[test]
+fn legato_two_voices_and_a_target_change_do_not_allocate() {
+    for rate in [44_100, 48_000, 96_000] {
+        let (mut p, _) = plugin(rate);
+        let mut events = vec![
+            // 303 #1: a held key, a legato slide over it, the return to the held key
+            on(0, 36, 80),
+            on(1_000, 43, 110),
+            off(3_000, 43),
+            // a key that is not sounding leaves, then the sounding one
+            on(4_000, 40, 80),
+            on(4_500, 47, 100),
+            off(5_000, 40),
+            off(6_000, 47),
+            // 303 #2 (MIDI channel 2) at the same time as 303 #1
+            on_ch(8_000, 2, 48, 90),
+            on_ch(8_500, 2, 55, 127),
+            on_ch(9_000, 1, 36, 80),
+            off_ch(11_000, 2, 55),
+            off_ch(12_000, 2, 48),
+            off_ch(13_000, 1, 36),
+            // keys beyond the stack's 16, then all of them up
+        ];
+        for k in 0..20u8 {
+            events.push(on(14_000 + k as usize * 10, 30 + k, 80));
+        }
+        for k in 0..20u8 {
+            events.push(off(16_000 + k as usize * 10, 30 + k));
+        }
+        // keys held across the target change, which releases them
+        events.push(on_ch(20_000, 1, 36, 80));
+        events.push(on_ch(20_500, 2, 43, 80));
+        let mut host = Host::new(128 * 256, &events);
+        let mut n = 0;
+        for k in 0..host.buffers() {
+            // the host changes the parameter between two process calls (the change itself is
+            // atomic stores in nih-plug's wrapper, outside the plugin's code)
+            if k == 200 {
+                common::set_target(&p, KeyboardTarget::B);
+            }
+            host.buffer(&mut p, k, |f| n += armed(f));
+        }
+        assert!(common::peak(&host.l) > 0.01, "{rate} Hz: silent");
+        let s = p.synth().unwrap();
+        assert_eq!(
+            s.held(Voice::A) + s.held(Voice::B),
+            0,
+            "{rate} Hz: keys held"
+        );
         assert_eq!(n, 0, "{rate} Hz: process allocated or freed {n} times");
     }
 }

@@ -1,5 +1,20 @@
-//! The keyboard synth: the engine of `orb-engine` with TB-303 #1 played by note events, at the
+//! The keyboard synth: the engine of `orb-engine` with both TB-303s played by note events, at the
 //! host's sample rate. It holds no plugin-framework type, so the tests drive it without a host.
+//!
+//! # Two mono voices with keyboard legato
+//!
+//! Each 303 is one [`Voice`]: mono, with a stack of the keys held on it ([`DEPTH`] deep; a key
+//! pressed beyond that is dropped, and its note-off then finds nothing). The last key pressed
+//! sounds. A key pressed over a held one, and a return to a held key when the sounding one goes
+//! up, are legato: the 303 slides into the new pitch without a new note. The gate closes when the
+//! last key goes up.
+//!
+//! In the engine a step's slide flag means "slide from this note into the next step"
+//! ([`Tb303::note_on`] reads the previous step's flag, and stores the new one). A keyboard only
+//! learns that when the second key arrives, so [`Keyboard303`] sets [`Tb303::slide`] right before
+//! the legato note-on ([`Key::Slide`]), with the step's own slide byte at 0: the gate stays
+//! open, the envelope is not triggered again, and the pitch glides to the new target. No
+//! note-off is made for the key being left.
 //!
 //! # The transport stays stopped
 //!
@@ -14,10 +29,10 @@
 //! # Reaching the 303
 //!
 //! The frame holds its channel devices as `Box<dyn ChannelDevice>`, which cannot be downcast to
-//! the [`Tb303`] behind it. Channel 0 is therefore [`Keyboard303`]: a [`Tb303`] plus the
-//! consumer of a lock-free queue of note events, which it applies at the start of its audio
-//! slot (the moment the sequencer's step would make them), then renders as the 303 does. Every
-//! other slot is the 303's own.
+//! the [`Tb303`] behind it. Channels 0 and 1 (the two 303s) are therefore [`Keyboard303`]: a
+//! [`Tb303`] plus the consumer of a lock-free queue of note events, which it applies at the
+//! start of its audio slot (the moment the sequencer's step would make them), then renders as
+//! the 303 does. Every other slot is the 303's own.
 //!
 //! # Rate and timing
 //!
@@ -60,15 +75,31 @@ pub const ORIGIN: u8 = 36;
 pub const LOWEST: u8 = ORIGIN - 12;
 /// The highest: `note 12` with `up`, two octaves above [`ORIGIN`].
 pub const HIGHEST: u8 = ORIGIN + 24;
-/// The velocity from which a note is accented (provisional; RV-03 refines it).
+/// The default velocity from which a note is accented (the plugin's "Accent velocity").
 pub const ACCENT_VELOCITY: u8 = 100;
-/// The note events one render can queue for the 303 before it drops the rest.
+/// The note events one render can queue for a 303 before it drops the rest.
 const KEYS: usize = 256;
+/// The keys held at once on one 303; the ones pressed beyond are dropped.
+pub const DEPTH: usize = 16;
+
+/// A 303 of the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Voice {
+    /// TB-303 #1 (channel 0 of the frame).
+    A,
+    /// TB-303 #2 (channel 1 of the frame).
+    B,
+}
 
 /// The 303 step `[note, slide, accent, up, down, rest]` for MIDI note `note` at `velocity`:
 /// the note folded by octaves into [`LOWEST`]..=[`HIGHEST`], then split into the step's note
 /// (0..12) and its octave switches. No slide; accent from [`ACCENT_VELOCITY`].
 pub fn step_for(note: u8, velocity: u8) -> [u8; 6] {
+    step_with(note, velocity, ACCENT_VELOCITY)
+}
+
+/// [`step_for`] with the accent threshold `accent`: accented from that velocity on.
+pub fn step_with(note: u8, velocity: u8, accent: u8) -> [u8; 6] {
     let mut n = note as i32;
     while n < LOWEST as i32 {
         n += 12;
@@ -84,7 +115,7 @@ pub fn step_for(note: u8, velocity: u8) -> [u8; 6] {
     } else {
         (s, 0, 0)
     };
-    let accent = (velocity >= ACCENT_VELOCITY) as u8;
+    let accent = (velocity >= accent) as u8;
     [key as u8, 0, accent, up, down, 0]
 }
 
@@ -93,12 +124,109 @@ pub fn step_for(note: u8, velocity: u8) -> [u8; 6] {
 enum Key {
     /// `Tb303::note_on` with this step.
     On([u8; 6]),
+    /// `Tb303::note_on` as a legato note: the slide flag is set first, so the gate stays open,
+    /// the envelope is not triggered and the pitch glides (see the module doc).
+    Slide([u8; 6]),
     /// `Tb303::note_off`.
     Off,
 }
 
-/// Channel 0 of the frame: a TB-303 that first plays the queued note events (see the module
-/// doc). Every slot but the audio is the 303's.
+/// The keys held on one 303, oldest first, with their velocities. A fixed array: nothing here
+/// allocates.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    keys: [(u8, u8); DEPTH],
+    len: usize,
+}
+
+impl Held {
+    const EMPTY: Held = Held {
+        keys: [(0, 0); DEPTH],
+        len: 0,
+    };
+
+    /// The key that sounds: the last pressed of the ones held.
+    fn top(&self) -> Option<(u8, u8)> {
+        self.len.checked_sub(1).map(|i| self.keys[i])
+    }
+
+    /// Removes `note`; whether it was held.
+    fn remove(&mut self, note: u8) -> bool {
+        let Some(i) = self.keys[..self.len].iter().position(|k| k.0 == note) else {
+            return false;
+        };
+        self.keys.copy_within(i + 1..self.len, i);
+        self.len -= 1;
+        true
+    }
+
+    /// Presses `note`; false (and nothing done) when [`DEPTH`] keys are held.
+    fn push(&mut self, note: u8, velocity: u8) -> bool {
+        if self.len == DEPTH {
+            return false;
+        }
+        self.keys[self.len] = (note, velocity);
+        self.len += 1;
+        true
+    }
+}
+
+/// One 303 as the keyboard plays it: the keys held, and the queue to its [`Keyboard303`].
+struct VoiceState {
+    held: Held,
+    keys: rtrb::Producer<Key>,
+}
+
+impl VoiceState {
+    fn note_on(&mut self, note: u8, velocity: u8, accent: u8) {
+        // pressing a note already held (a host that lost its note-off) moves it to the top; the
+        // gate is open and no note-off came, so it is legato (a slide to the same pitch)
+        let legato = self.held.top().is_some();
+        let mut next = self.held;
+        next.remove(note);
+        if !next.push(note, velocity) {
+            return;
+        }
+        let step = step_with(note, velocity, accent);
+        let key = if legato {
+            Key::Slide(step)
+        } else {
+            Key::On(step)
+        };
+        if self.keys.push(key).is_ok() {
+            self.held = next;
+        }
+    }
+
+    fn note_off(&mut self, note: u8, accent: u8) {
+        let mut next = self.held;
+        if !next.remove(note) {
+            return;
+        }
+        if self.held.top().map(|k| k.0) != Some(note) {
+            // not the sounding key: it only leaves the stack
+            self.held = next;
+            return;
+        }
+        // the sounding key went up: back to the key held before it, or the gate closes
+        let key = match next.top() {
+            Some((n, v)) => Key::Slide(step_with(n, v, accent)),
+            None => Key::Off,
+        };
+        if self.keys.push(key).is_ok() {
+            self.held = next;
+        }
+    }
+
+    fn all_notes_off(&mut self) {
+        if self.keys.push(Key::Off).is_ok() {
+            self.held = Held::EMPTY;
+        }
+    }
+}
+
+/// A channel of the frame that holds a TB-303: it first plays the queued note events (see the
+/// module doc). Every slot but the audio is the 303's.
 struct Keyboard303 {
     tb: Tb303,
     keys: rtrb::Consumer<Key>,
@@ -157,6 +285,12 @@ impl ChannelDevice for Keyboard303 {
         while let Ok(k) = self.keys.pop() {
             match k {
                 Key::On(step) => self.tb.note_on(step),
+                Key::Slide(step) => {
+                    // the slide flag of the step being left; `note_on` stores the new step's
+                    // own (0) afterwards, so only this transition slides
+                    self.tb.slide = true;
+                    self.tb.note_on(step);
+                }
                 Key::Off => self.tb.note_off(),
             }
         }
@@ -207,9 +341,10 @@ impl Resample {
 /// The engine played from a keyboard, at the host's rate (see the module doc).
 pub struct Synth {
     engine: Box<Engine>,
-    keys: rtrb::Producer<Key>,
-    /// The note that opened the 303's gate last, until its note-off.
-    held: Option<u8>,
+    /// TB-303 #1 and #2, in the order of [`Voice`].
+    voices: [VoiceState; 2],
+    /// The velocity from which a note is accented.
+    accent: u8,
     rate: u32,
     resample: Option<Resample>,
     /// The frames at the host rate not yet handed out, interleaved: `out[2*pos..2*len]`.
@@ -228,12 +363,19 @@ impl Synth {
         if rate == 0 {
             return Err("a sample rate of 0".into());
         }
-        let (keys, rx) = rtrb::RingBuffer::new(KEYS);
         let mut devices = Devices::implemented(None);
-        devices.channels[0] = Box::new(Keyboard303 {
-            tb: Tb303::new(),
-            keys: rx,
-        });
+        let mut voice = |channel: usize| {
+            let (keys, rx) = rtrb::RingBuffer::new(KEYS);
+            devices.channels[channel] = Box::new(Keyboard303 {
+                tb: Tb303::new(),
+                keys: rx,
+            });
+            VoiceState {
+                held: Held::EMPTY,
+                keys,
+            }
+        };
+        let voices = [voice(0), voice(1)];
         let engine = Box::new(Engine::new(Arc::new(Tables::new()), devices));
         let resample = if rate == ENGINE_RATE {
             None
@@ -246,8 +388,8 @@ impl Synth {
         };
         Ok(Synth {
             engine,
-            keys,
-            held: None,
+            voices,
+            accent: ACCENT_VELOCITY,
             rate,
             resample,
             out: vec![0.0; 2 * frames].into_boxed_slice(),
@@ -284,33 +426,48 @@ impl Synth {
         self.errors
     }
 
-    /// MIDI note-on (`velocity` 1..127; 0 is a note-off): the 303 plays the note from the next
-    /// block on. Mono, last note wins, no slide.
-    pub fn note_on(&mut self, note: u8, velocity: u8) {
+    /// Sets the velocity from which a note is accented (it applies to the notes played from
+    /// now on, and to the held key a release returns to).
+    pub fn set_accent_velocity(&mut self, velocity: u8) {
+        self.accent = velocity;
+    }
+
+    /// MIDI note-on (`velocity` 1..127; 0 is a note-off) on `voice`: the 303 plays the note
+    /// from the next block on. Mono, last note wins; pressed over a held key, it slides.
+    pub fn note_on(&mut self, voice: Voice, note: u8, velocity: u8) {
         if velocity == 0 {
-            self.note_off(note);
+            self.note_off(voice, note);
             return;
         }
-        if self.keys.push(Key::On(step_for(note, velocity))).is_ok() {
-            self.held = Some(note);
-        }
+        let accent = self.accent;
+        self.voices[voice as usize].note_on(note, velocity, accent);
     }
 
-    /// MIDI note-off: closes the 303's gate when `note` is the one that opened it.
-    pub fn note_off(&mut self, note: u8) {
-        if self.held == Some(note) && self.keys.push(Key::Off).is_ok() {
-            self.held = None;
-        }
+    /// MIDI note-off on `voice`: a key that is not sounding only leaves the stack; the sounding
+    /// one returns to the key held before it (a slide), or closes the gate when it is the last.
+    pub fn note_off(&mut self, voice: Voice, note: u8) {
+        let accent = self.accent;
+        self.voices[voice as usize].note_off(note, accent);
     }
 
-    /// Closes the 303's gate whatever note opened it.
+    /// How many keys are held on `voice`.
+    pub fn held(&self, voice: Voice) -> usize {
+        self.voices[voice as usize].held.len
+    }
+
+    /// The note that sounds on `voice` (the last pressed of the keys held), if any.
+    pub fn sounding(&self, voice: Voice) -> Option<u8> {
+        self.voices[voice as usize].held.top().map(|k| k.0)
+    }
+
+    /// Closes both 303s' gates and forgets every held key.
     pub fn all_notes_off(&mut self) {
-        if self.keys.push(Key::Off).is_ok() {
-            self.held = None;
+        for v in &mut self.voices {
+            v.all_notes_off();
         }
     }
 
-    /// Drops the frames not yet handed out and the resampler's history, and closes the gate.
+    /// Drops the frames not yet handed out and the resampler's history, and closes the gates.
     pub fn reset(&mut self) {
         self.all_notes_off();
         self.len = 0;
